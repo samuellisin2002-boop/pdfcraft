@@ -18,7 +18,7 @@ import { loadPdfjs, loadPdfLib } from '../loader';
 /**
  * Supported OCR languages
  */
-export type OCRLanguage = 'eng' | 'chi_sim' | 'chi_tra' | 'jpn' | 'kor' | 'spa' | 'fra' | 'deu' | 'por' | 'ara' | 'hun' | 'ori';
+export type OCRLanguage = 'eng' | 'chi_sim' | 'chi_tra' | 'jpn' | 'kor' | 'spa' | 'fra' | 'deu' | 'por' | 'ara' | 'hun' | 'ori' | 'rus';
 
 /**
  * OCR options
@@ -68,6 +68,7 @@ export const OCR_LANGUAGE_NAMES: Record<OCRLanguage, string> = {
   ara: 'Arabic',
   hun: 'Hungarian',
   ori: 'Odia (Oriya)',
+  rus: 'Russian (Русский)',
 };
 
 // Tesseract worker type
@@ -594,7 +595,13 @@ export class OCRProcessor extends BasePDFProcessor {
    */
   private async initializeTesseract(languages: OCRLanguage[]): Promise<void> {
     const Tesseract = await import('tesseract.js');
-    const langString = languages && languages.length > 0 ? languages.join('+') : 'eng';
+    const langList = languages && languages.length > 0 ? [...languages] : ['eng'];
+    // Russian documents routinely contain Latin words, numbers and abbreviations,
+    // so always pair Russian with English for better recognition.
+    if (langList.includes('rus') && !langList.includes('eng')) {
+      langList.push('eng');
+    }
+    const langString = langList.join('+');
 
     this.tesseractWorker = await Tesseract.createWorker(langString, 1, {
       logger: (m: any) => {

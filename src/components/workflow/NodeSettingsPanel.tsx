@@ -799,6 +799,7 @@ const getToolSettingsConfig = (): Record<string, ToolSettingsConfig> => ({
                     { value: 'ara', labelKey: 'العربية' },
                     { value: 'hun', labelKey: 'Magyar' },
                     { value: 'ori', labelKey: 'Odia (ଓଡ଼ିଆ)' },
+                    { value: 'rus', labelKey: 'Русский' },
                 ],
             },
         ],

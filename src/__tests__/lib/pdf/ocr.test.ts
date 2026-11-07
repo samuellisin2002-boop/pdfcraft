@@ -265,6 +265,26 @@ describe('OCRProcessor', () => {
       expect(result.metadata?.languages).toEqual(['chi_sim']);
     });
 
+    it('initializes Tesseract with rus+eng when Russian is selected', async () => {
+      const Tesseract = await import('tesseract.js');
+      const createWorkerMock = vi.mocked(Tesseract.createWorker);
+      createWorkerMock.mockClear();
+
+      const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x34]);
+      const file = new File([pdfBytes], 'russian.pdf', { type: 'application/pdf' });
+
+      const result = await processor.process({
+        files: [file],
+        options: {
+          languages: ['rus'],
+          outputFormat: 'text',
+        },
+      });
+
+      expect(result.success).toBe(true);
+      expect(createWorkerMock).toHaveBeenCalledWith('rus+eng', 1, expect.any(Object));
+    });
+
     it('processes image file by converting to searchable PDF', async () => {
       const pngBytes = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
       const file = new File([pngBytes], 'scan.png', { type: 'image/png' });
