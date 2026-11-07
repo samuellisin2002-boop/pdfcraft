@@ -282,7 +282,11 @@ describe('OCRProcessor', () => {
       });
 
       expect(result.success).toBe(true);
-      expect(createWorkerMock).toHaveBeenCalledWith('rus+eng', 1, expect.any(Object));
+      expect(createWorkerMock).toHaveBeenCalledWith(
+        'rus+eng',
+        1,
+        expect.objectContaining({ langPath: expect.stringContaining('/tessdata'), gzip: false })
+      );
     });
 
     it('processes image file by converting to searchable PDF', async () => {

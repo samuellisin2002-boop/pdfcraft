@@ -21,6 +21,11 @@ import { loadPdfjs, loadPdfLib } from '../loader';
 export type OCRLanguage = 'eng' | 'chi_sim' | 'chi_tra' | 'jpn' | 'kor' | 'spa' | 'fra' | 'deu' | 'por' | 'ara' | 'hun' | 'ori' | 'rus';
 
 /**
+ * Languages whose uncompressed traineddata is bundled in public/tessdata
+ */
+export const LOCAL_TESSDATA_LANGS = ['eng', 'rus'] as const;
+
+/**
  * OCR options
  */
 export interface OCROptions {
@@ -603,7 +608,14 @@ export class OCRProcessor extends BasePDFProcessor {
     }
     const langString = langList.join('+');
 
+    // Use the bundled traineddata (public/tessdata) when every requested language
+    // is shipped with the app; otherwise fall back to Tesseract.js' default source.
+    const useLocalLangData =
+      typeof window !== 'undefined' &&
+      langList.every((l) => (LOCAL_TESSDATA_LANGS as readonly string[]).includes(l));
+
     this.tesseractWorker = await Tesseract.createWorker(langString, 1, {
+      ...(useLocalLangData ? { langPath: `${process.env.NEXT_PUBLIC_BASE_PATH || ''}/tessdata`, gzip: false } : {}),
       logger: (m: any) => {
         if (m && m.status) {
           const percent = typeof m.progress === 'number' ? Math.round(m.progress * 100) : 0;
