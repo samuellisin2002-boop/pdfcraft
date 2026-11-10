@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { getAllTools } from '@/config/tools';
-import { getToolContent, toolContentEn, toolContentPl, toolContentCs, toolContentHi } from '@/config/tool-content';
+import { getToolContent, toolContentEn, toolContentPl, toolContentCs, toolContentHi, toolContentRu } from '@/config/tool-content';
 
 describe('tool content integrity', () => {
   it('provides fallback content for every configured tool to avoid 404 pages', () => {
@@ -63,6 +63,18 @@ describe('tool content integrity', () => {
     expect(getToolContent('hi', 'merge-pdf')?.title).toBe('PDF मर्ज करें');
     expect(getToolContent('hi', 'split-pdf')?.title).toBe('PDF विभाजित करें');
     expect(getToolContent('hi', 'compress-pdf')?.title).toBe('PDF कंप्रेस करें');
+  });
+
+  it('provides complete Russian tool content without English fallback', () => {
+    const englishToolIds = Object.keys(toolContentEn);
+    const fallbackTools = englishToolIds.filter(
+      (toolId) => getToolContent('ru', toolId) !== toolContentRu[toolId]
+    );
+
+    expect(Object.keys(toolContentRu).sort()).toEqual(englishToolIds.sort());
+    expect(fallbackTools).toEqual([]);
+    expect(getToolContent('ru', 'merge-pdf')?.title).toMatch(/[а-яё]/i);
+    expect(getToolContent('ru', 'ocr-pdf')?.title).toMatch(/[а-яё]/i);
   });
 
   it('keeps Chinese tool titles localized instead of falling back to English slugs', () => {

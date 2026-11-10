@@ -125,8 +125,10 @@ export async function saveFile(suggestedName: string, filters: FileFilter[] = []
 export async function readFileBytes(path: string): Promise<Uint8Array> {
   if (isTauri()) {
     const invoke = await getTauriInvoke();
-    const data = await invoke<number[]>('read_file', { path });
-    return new Uint8Array(data);
+    // The native command returns a raw binary response (ArrayBuffer); older builds
+    // returned a JSON number array, so accept both.
+    const data = await invoke<ArrayBuffer | number[]>('read_file', { path });
+    return data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data);
   }
 
   const file = browserFileStore.get(path);
@@ -142,7 +144,9 @@ export async function writeFileBytes(path: string, data: Uint8Array): Promise<vo
   if (isTauri()) {
     try {
       const invoke = await getTauriInvoke();
-      await invoke('write_file', { path, data: Array.from(data) });
+      // Send the bytes as a raw binary body (no JSON number array: converting a
+      // large PDF with Array.from() exhausts memory and crashes the webview).
+      await invoke('write_file', data, { headers: { path: encodeURIComponent(path) } });
       return;
     } catch (err) {
       try {

@@ -68,14 +68,47 @@ async fn save_file(app: tauri::AppHandle, suggested_name: String, filters: Vec<F
     }
 }
 
-#[tauri::command]
-fn read_file(path: String) -> Result<Vec<u8>, String> {
-    fs::read(&path).map_err(|e| e.to_string())
+/// Decode a percent-encoded (encodeURIComponent) UTF-8 string from an IPC header.
+fn percent_decode(input: &str) -> Result<String, String> {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|e| e.to_string())?;
+            out.push(u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
 }
 
+/// Returns file contents as a raw binary IPC response. Returning `Vec<u8>` would be
+/// serialized as a JSON number array, which exhausts memory for large PDFs.
 #[tauri::command]
-fn write_file(path: String, data: Vec<u8>) -> Result<(), String> {
-    fs::write(&path, data).map_err(|e| e.to_string())
+fn read_file(path: String) -> Result<tauri::ipc::Response, String> {
+    fs::read(&path)
+        .map(tauri::ipc::Response::new)
+        .map_err(|e| e.to_string())
+}
+
+/// Writes raw bytes sent as the IPC request body. The destination path is passed
+/// percent-encoded in the `path` header so large files never go through JSON.
+#[tauri::command]
+fn write_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let encoded = request
+        .headers()
+        .get("path")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| "Missing 'path' header".to_string())?;
+    let path = percent_decode(encoded)?;
+    match request.body() {
+        tauri::ipc::InvokeBody::Raw(data) => fs::write(&path, data).map_err(|e| e.to_string()),
+        _ => Err("Expected raw binary request body".to_string()),
+    }
 }
 
 #[tauri::command]

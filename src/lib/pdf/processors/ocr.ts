@@ -305,7 +305,8 @@ export async function detectFileType(file: File | Blob): Promise<'pdf' | 'image'
  * Performs OCR on PDF pages or images using Tesseract.js.
  */
 export class OCRProcessor extends BasePDFProcessor {
-  private tesseractWorker: TesseractWorker | null = null;
+  private workers: TesseractWorker[] = [];
+  private reportInitProgress = false;
 
   /**
    * Process PDF or Image with OCR
@@ -374,12 +375,7 @@ export class OCRProcessor extends BasePDFProcessor {
         );
       }
 
-      this.updateProgress(10, 'Initializing OCR engine...');
-
-      // Initialize Tesseract
-      await this.initializeTesseract(ocrOptions.languages);
-
-      this.updateProgress(20, 'Loading document...');
+      this.updateProgress(10, 'Loading document...');
 
       // If the input file is an image, convert it to a single-page PDF first
       let pdfBytesToLoad: Uint8Array;
@@ -407,7 +403,6 @@ export class OCRProcessor extends BasePDFProcessor {
         : Array.from({ length: totalPages }, (_, i) => i + 1);
 
       if (pagesToOCR.length === 0) {
-        await this.terminateTesseract();
         return this.createErrorOutput(
           PDFErrorCode.INVALID_PAGE_RANGE,
           'No valid pages to OCR.',
@@ -415,39 +410,74 @@ export class OCRProcessor extends BasePDFProcessor {
         );
       }
 
-      this.updateProgress(25, `Processing ${pagesToOCR.length} page(s)...`);
+      // Start a pool of OCR workers (one per CPU core pair, capped) so large documents
+      // are recognized in parallel instead of page by page.
+      this.updateProgress(15, 'Initializing OCR engine...');
+      const poolSize = OCRProcessor.getPoolSize(pagesToOCR.length);
+      await this.initializeTesseract(ocrOptions.languages, poolSize);
 
-      const textResults: string[] = [];
-      const ocrPagesData: Array<{ pageNum: number; words: any[] }> = [];
-      const progressPerPage = 70 / pagesToOCR.length;
-
-      for (let i = 0; i < pagesToOCR.length; i++) {
-        if (this.checkCancelled()) {
-          await this.terminateTesseract();
-          return this.createErrorOutput(
-            PDFErrorCode.PROCESSING_CANCELLED,
-            'Processing was cancelled.'
-          );
-        }
-
-        const pageNum = pagesToOCR[i];
-        const pageProgress = 25 + (i * progressPerPage);
-
-        this.updateProgress(
-          pageProgress,
-          `OCR processing page ${pageNum} of ${totalPages}...`
+      if (this.checkCancelled()) {
+        await this.terminateTesseract();
+        return this.createErrorOutput(
+          PDFErrorCode.PROCESSING_CANCELLED,
+          'Processing was cancelled.'
         );
-
-        try {
-          const pageData = await this.ocrPage(pdf, pageNum, ocrOptions);
-          textResults.push(`--- Page ${pageNum} ---\n${pageData.text}`);
-          ocrPagesData.push({ pageNum, words: pageData.words });
-        } catch (error) {
-          textResults.push(`--- Page ${pageNum} ---\n[OCR Error: ${error instanceof Error ? error.message : 'Unknown error'}]`);
-        }
       }
 
+      this.updateProgress(25, `Processing ${pagesToOCR.length} page(s)...`);
+
+      type PageResult = { pageNum: number; text: string; words: any[]; error?: string };
+      const results: PageResult[] = new Array(pagesToOCR.length);
+      let nextIndex = 0;
+      let completed = 0;
+      let wasCancelled = false;
+
+      const runWorker = async (worker: TesseractWorker): Promise<void> => {
+        while (true) {
+          if (this.checkCancelled()) {
+            wasCancelled = true;
+            return;
+          }
+          const i = nextIndex++;
+          if (i >= pagesToOCR.length) return;
+          const pageNum = pagesToOCR[i];
+          try {
+            const pageData = await this.ocrPage(pdf, pageNum, ocrOptions, worker);
+            results[i] = { pageNum, text: pageData.text, words: pageData.words };
+          } catch (error) {
+            results[i] = {
+              pageNum,
+              text: '',
+              words: [],
+              error: error instanceof Error ? error.message : 'Unknown error',
+            };
+          }
+          completed++;
+          this.updateProgress(
+            25 + (completed / pagesToOCR.length) * 70,
+            `OCR processing: ${completed} of ${pagesToOCR.length} page(s) (PDF has ${totalPages})...`
+          );
+        }
+      };
+
+      await Promise.all(this.workers.map((w) => runWorker(w)));
       await this.terminateTesseract();
+
+      if (wasCancelled || this.checkCancelled()) {
+        return this.createErrorOutput(
+          PDFErrorCode.PROCESSING_CANCELLED,
+          'Processing was cancelled.'
+        );
+      }
+
+      const textResults: string[] = results.map((r) =>
+        r.error
+          ? `--- Page ${r.pageNum} ---\n[OCR Error: ${r.error}]`
+          : `--- Page ${r.pageNum} ---\n${r.text}`
+      );
+      const ocrPagesData: Array<{ pageNum: number; text: string; words: any[] }> = results
+        .filter((r) => !r.error)
+        .map((r) => ({ pageNum: r.pageNum, text: r.text, words: r.words }));
 
       this.updateProgress(95, 'Generating output...');
 
@@ -480,9 +510,9 @@ export class OCRProcessor extends BasePDFProcessor {
         outputFilename = `${baseName}_ocr.txt`;
       } else if (ocrOptions.outputFormat === 'markdown') {
         const mdText = generateMarkdownOutput(
-          ocrPagesData.map((p, idx) => ({
+          ocrPagesData.map((p) => ({
             pageNum: p.pageNum,
-            text: textResults[idx] ? textResults[idx].replace(/^--- Page \d+ ---\n/, '') : '',
+            text: p.text,
             words: p.words,
           })),
           file.name
@@ -491,9 +521,9 @@ export class OCRProcessor extends BasePDFProcessor {
         outputFilename = `${baseName}_ocr.md`;
       } else if (ocrOptions.outputFormat === 'json') {
         const jsonText = generateJsonOutput(
-          ocrPagesData.map((p, idx) => ({
+          ocrPagesData.map((p) => ({
             pageNum: p.pageNum,
-            text: textResults[idx] ? textResults[idx].replace(/^--- Page \d+ ---\n/, '') : '',
+            text: p.text,
             words: p.words,
           })),
           {
@@ -598,7 +628,7 @@ export class OCRProcessor extends BasePDFProcessor {
   /**
    * Initialize Tesseract worker with progress reporting
    */
-  private async initializeTesseract(languages: OCRLanguage[]): Promise<void> {
+  private async initializeTesseract(languages: OCRLanguage[], poolSize = 1): Promise<void> {
     const Tesseract = await import('tesseract.js');
     const langList = languages && languages.length > 0 ? [...languages] : ['eng'];
     // Russian documents routinely contain Latin words, numbers and abbreviations,
@@ -614,28 +644,50 @@ export class OCRProcessor extends BasePDFProcessor {
       typeof window !== 'undefined' &&
       langList.every((l) => (LOCAL_TESSDATA_LANGS as readonly string[]).includes(l));
 
-    this.tesseractWorker = await Tesseract.createWorker(langString, 1, {
-      ...(useLocalLangData ? { langPath: `${process.env.NEXT_PUBLIC_BASE_PATH || ''}/tessdata`, gzip: false } : {}),
-      logger: (m: any) => {
-        if (m && m.status) {
-          const percent = typeof m.progress === 'number' ? Math.round(m.progress * 100) : 0;
-          this.updateProgress(
-            15 + Math.round((m.progress || 0) * 10),
-            `OCR: ${m.status}${percent > 0 ? ` (${percent}%)` : ''}`
-          );
-        }
-      },
-    }) as unknown as TesseractWorker;
+    this.reportInitProgress = true;
+    try {
+      this.workers = await Promise.all(
+        Array.from({ length: Math.max(1, poolSize) }, () =>
+          Tesseract.createWorker(langString, 1, {
+            ...(useLocalLangData
+              ? { langPath: `${process.env.NEXT_PUBLIC_BASE_PATH || ''}/tessdata`, gzip: false }
+              : {}),
+            logger: (m: any) => {
+              // Only report engine/language loading; per-page progress is reported by the pool.
+              if (this.reportInitProgress && m && m.status) {
+                this.updateProgress(
+                  15 + Math.round((m.progress || 0) * 10),
+                  `OCR: ${m.status}`
+                );
+              }
+            },
+          }) as unknown as Promise<TesseractWorker>
+        )
+      );
+    } finally {
+      this.reportInitProgress = false;
+    }
   }
 
   /**
-   * Terminate Tesseract worker
+   * Number of parallel OCR workers: about half the CPU cores, 1-4, never more than pages.
+   * Each worker holds the language model in memory, so the pool is deliberately capped.
+   */
+  private static getPoolSize(pageCount: number): number {
+    const cores =
+      typeof navigator !== 'undefined' && navigator.hardwareConcurrency
+        ? navigator.hardwareConcurrency
+        : 2;
+    return Math.max(1, Math.min(4, Math.floor(cores / 2), pageCount));
+  }
+
+  /**
+   * Terminate all Tesseract workers
    */
   private async terminateTesseract(): Promise<void> {
-    if (this.tesseractWorker) {
-      await this.tesseractWorker.terminate();
-      this.tesseractWorker = null;
-    }
+    const workers = this.workers;
+    this.workers = [];
+    await Promise.all(workers.map((w) => w.terminate().catch(() => undefined)));
   }
 
   /**
@@ -644,12 +696,9 @@ export class OCRProcessor extends BasePDFProcessor {
   private async ocrPage(
     pdf: any,
     pageNum: number,
-    options: OCROptions
+    options: OCROptions,
+    worker: TesseractWorker
   ): Promise<{ text: string; words: any[] }> {
-    if (!this.tesseractWorker) {
-      throw new Error('Tesseract worker not initialized');
-    }
-
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale: options.scale });
 
@@ -658,63 +707,82 @@ export class OCRProcessor extends BasePDFProcessor {
     canvas.width = viewport.width;
     canvas.height = viewport.height;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      throw new Error('Failed to get canvas context');
-    }
+    try {
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        throw new Error('Failed to get canvas context');
+      }
 
-    // Fill with white background
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+      // Fill with white background
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Render PDF page to canvas
-    await page.render({
-      canvasContext: ctx,
-      viewport: viewport,
-    }).promise;
+      // Render PDF page to canvas
+      await page.render({
+        canvasContext: ctx,
+        viewport: viewport,
+      }).promise;
 
-    // Apply smart image contrast enhancement if enabled (reduces noise on receipts/scans)
-    if (options.enhanceContrast !== false) {
-      preprocessCanvas(canvas);
-    }
+      // Apply smart image contrast enhancement if enabled (reduces noise on receipts/scans)
+      if (options.enhanceContrast !== false) {
+        preprocessCanvas(canvas);
+      }
 
-    // Perform OCR with explicit blocks/hocr requests to ensure word coordinates are extracted
-    const result = await (this.tesseractWorker as any).recognize(
-      canvas,
-      {},
-      { text: true, blocks: true, hocr: true }
-    );
-    
-    // Coordinate conversion from canvas space to PDF coordinate space (y-flipped)
-    const pdfViewport = page.getViewport({ scale: 1.0 });
-    const pageHeight = pdfViewport.height;
+      // Request text plus the block hierarchy (word boxes); hOCR is much slower and unused.
+      const result = await (worker as any).recognize(
+        canvas,
+        {},
+        { text: true, blocks: true }
+      );
 
-    const rawWords = result.data.words || [];
-    const words = rawWords.map((w: any) => {
-      const bbox = w.bbox || { x0: 0, y0: 0, x1: 0, y1: 0 };
-      const { x0, y0, x1, y1 } = bbox;
-      const scale = options.scale;
-      
-      const pdfX = x0 / scale;
-      const pdfY = pageHeight - (y1 / scale);
-      const pdfWidth = (x1 - x0) / scale;
-      const pdfHeight = (y1 - y0) / scale;
+      // Coordinate conversion from canvas space to PDF coordinate space (y-flipped)
+      const pdfViewport = page.getViewport({ scale: 1.0 });
+      const pageHeight = pdfViewport.height;
+
+      // Words may be exposed flat (data.words) or only inside the block hierarchy.
+      let rawWords: any[] = result.data.words || [];
+      if (rawWords.length === 0 && Array.isArray(result.data.blocks)) {
+        rawWords = [];
+        for (const block of result.data.blocks) {
+          for (const para of block.paragraphs || []) {
+            for (const line of para.lines || []) {
+              for (const word of line.words || []) rawWords.push(word);
+            }
+          }
+        }
+      }
+
+      const words = rawWords.map((w: any) => {
+        const bbox = w.bbox || { x0: 0, y0: 0, x1: 0, y1: 0 };
+        const { x0, y0, x1, y1 } = bbox;
+        const scale = options.scale;
+
+        const pdfX = x0 / scale;
+        const pdfY = pageHeight - (y1 / scale);
+        const pdfWidth = (x1 - x0) / scale;
+        const pdfHeight = (y1 - y0) / scale;
+
+        return {
+          text: w.text,
+          confidence: typeof w.confidence === 'number' ? Math.round(w.confidence) : 90,
+          x: pdfX,
+          y: pdfY,
+          width: pdfWidth,
+          height: pdfHeight,
+          fontSize: Math.max(5, pdfHeight * 0.85),
+        };
+      });
 
       return {
-        text: w.text,
-        confidence: typeof w.confidence === 'number' ? Math.round(w.confidence) : 90,
-        x: pdfX,
-        y: pdfY,
-        width: pdfWidth,
-        height: pdfHeight,
-        fontSize: Math.max(5, pdfHeight * 0.85),
+        text: result.data.text || '',
+        words,
       };
-    });
-
-    return {
-      text: result.data.text || '',
-      words,
-    };
+    } finally {
+      // Release the page bitmap immediately: 700 full-size canvases kept alive crash the app.
+      canvas.width = 0;
+      canvas.height = 0;
+      if (typeof page.cleanup === 'function') page.cleanup();
+    }
   }
 
   /**
@@ -722,7 +790,7 @@ export class OCRProcessor extends BasePDFProcessor {
    */
   private async createSearchablePDF(
     originalFile: File,
-    ocrPagesData: Array<{ pageNum: number; words: any[] }>,
+    ocrPagesData: Array<{ pageNum: number; text?: string; words: any[] }>,
     options: OCROptions
   ): Promise<Blob> {
     const pdfLib = await loadPdfLib();
@@ -762,19 +830,30 @@ export class OCRProcessor extends BasePDFProcessor {
       }
 
       if (fontBuffer) {
-        unicodeFont = await pdfDoc.embedFont(fontBuffer, { subset: false });
+        // Subset: embedding the entire CJK font (~10+ MB) per output made big files huge and slow.
+        unicodeFont = await pdfDoc.embedFont(fontBuffer, { subset: true });
       }
     } catch (fontErr) {
       console.warn('[OCR] Unicode font embedding not available, falling back to standard font', fontErr);
     }
 
     const standardFont = await pdfDoc.embedFont(pdfLib.StandardFonts.Helvetica);
+    const useInvisibleMode =
+      typeof (pdfLib as any).setTextRenderingMode === 'function' &&
+      typeof (pdfLib as any).pushGraphicsState === 'function' &&
+      typeof (pdfLib as any).popGraphicsState === 'function';
 
     for (const pageData of ocrPagesData) {
       const pageIdx = pageData.pageNum - 1;
       if (pageIdx >= pdfDoc.getPageCount()) continue;
 
       const page = pdfDoc.getPage(pageIdx);
+
+      // Preferred: PDF text render mode 3 (invisible) set once per page. This avoids creating a
+      // separate transparency graphics state for every word (hundreds of thousands on big scans).
+      if (useInvisibleMode) {
+        page.pushOperators(pdfLib.pushGraphicsState(), pdfLib.setTextRenderingMode(3));
+      }
 
       // Draw invisible text items
       for (const w of pageData.words) {
@@ -792,7 +871,7 @@ export class OCRProcessor extends BasePDFProcessor {
             size: Math.max(4, Math.min(72, w.fontSize)),
             font: fontToUse,
             color: pdfLib.rgb(0, 0, 0),
-            opacity: 0.0, // Totally invisible text overlay
+            ...(useInvisibleMode ? {} : { opacity: 0.0 }), // Totally invisible text overlay
           });
         } catch (e) {
           // Fallback: try drawing safe ASCII version if possible
@@ -806,7 +885,7 @@ export class OCRProcessor extends BasePDFProcessor {
                   size: Math.max(4, Math.min(72, w.fontSize)),
                   font: standardFont,
                   color: pdfLib.rgb(0, 0, 0),
-                  opacity: 0.0,
+                  ...(useInvisibleMode ? {} : { opacity: 0.0 }),
                 });
               }
             } catch {
@@ -814,6 +893,10 @@ export class OCRProcessor extends BasePDFProcessor {
             }
           }
         }
+      }
+
+      if (useInvisibleMode) {
+        page.pushOperators(pdfLib.popGraphicsState());
       }
     }
 
